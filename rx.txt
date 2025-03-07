@@ -1,0 +1,191 @@
+#![no_std]
+#![no_main]
+
+use core::{ptr::addr_of_mut, str};
+
+use embassy_executor::Spawner;
+use embassy_time::{Delay, Duration, Timer};
+use esp_backtrace as _;
+use esp_hal::{
+    self, clock::CpuClock, cpu_control::{CpuControl, Stack}, dma::{DmaRxBuf, DmaTxBuf}, dma_buffers, gpio::{Input, Level, Output, Pull}, interrupt::{software::SoftwareInterruptControl, Priority}, spi::{
+        master::{Config, Spi, SpiDmaBus},
+        Mode,
+    }, time::RateExtU32, timer::{timg::TimerGroup, AnyTimer}, Async
+};
+use esp_hal_embassy::{main, Executor, InterruptExecutor};
+use esp_println::println;
+use embedded_hal_bus::spi::ExclusiveDevice;
+use embassy_sync::channel::Channel;
+use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
+use log::info;
+
+//LoRa
+use lora_phy::iv::GenericSx126xInterfaceVariant;
+use lora_phy::sx126x::{Sx1262, Sx126x, TcxoCtrlVoltage};
+use lora_phy::LoRa;
+use lora_phy::{mod_params::*, sx126x};
+use static_cell::StaticCell;
+
+const LORA_FREQUENCY_IN_HZ: u32 = 903_900_000;
+const LORA_BANDWIDTH: Bandwidth = Bandwidth::_250KHz;
+const LORA_SPREADING_FACTOR: SpreadingFactor = SpreadingFactor::_10;
+const LORA_CODING_RATE: CodingRate = CodingRate::_4_8;
+const LORA_PREAMBLE_LENGTH: u16 = 8;
+const LORA_TX_POWER: i32 = 1;
+
+//Multicore
+//static mut APP_CORE_STACK: esp_hal::cpu_control::Stack<8192> = esp_hal::cpu_control::Stack::new();
+static mut CORE1_STACK: Stack<4096> = Stack::new();
+static EXECUTOR0: StaticCell<Executor> = StaticCell::new();
+static EXECUTOR1: StaticCell<Executor> = StaticCell::new();
+static CHANNEL: Channel<CriticalSectionRawMutex, &str, 1> = Channel::new();
+
+#[main]
+async fn main(_spawner: Spawner) {
+    esp_println::logger::init_logger_from_env();
+
+    let mut config = esp_hal::Config::default();
+    config.cpu_clock = CpuClock::max();
+    let peripherals = esp_hal::init(config);
+    
+    let timg0 = TimerGroup::new(peripherals.TIMG0);
+    let timer0: AnyTimer = timg0.timer0.into();
+    let timer1: AnyTimer = timg0.timer1.into();
+    esp_hal_embassy::init([timer0, timer1]);
+
+    //threading
+    let mut cpu_control = CpuControl::new(peripherals.CPU_CTRL);
+    
+    //SPI configuration
+    let sclk = peripherals.GPIO9;
+    let miso = peripherals.GPIO11;
+    let mosi = peripherals.GPIO10;
+    let cs = peripherals.GPIO8;
+    let dma_channel = peripherals.DMA_CH0;
+
+    let (rx_buffer, rx_descriptors, tx_buffer, tx_descriptors) = dma_buffers!(32000);
+    let dma_rx_buf = DmaRxBuf::new(rx_descriptors, rx_buffer).unwrap();
+    let dma_tx_buf = DmaTxBuf::new(tx_descriptors, tx_buffer).unwrap();
+
+    let spi = Spi::new(
+        peripherals.SPI2,
+        Config::default()
+            .with_frequency(RateExtU32::kHz(100))
+            .with_mode(Mode::_0),
+    )
+    .unwrap()
+    .with_sck(sclk)
+    .with_mosi(mosi)
+    .with_miso(miso)
+    .with_dma(dma_channel)
+    .with_buffers(dma_rx_buf, dma_tx_buf)
+    .into_async();
+
+    //LoRa
+    let nss = Output::new(cs, Level::High);
+    let reset = Output::new(peripherals.GPIO12, Level::High);
+    let dio1 = Input::new(peripherals.GPIO14, Pull::None);
+    let busy = Input::new(peripherals.GPIO13, Pull::None);
+
+    let spi = ExclusiveDevice::new(spi, nss, Delay).unwrap();
+
+    let iv = GenericSx126xInterfaceVariant::new(reset, dio1, busy, None, None).unwrap();
+    let debug_indicator = Output::new(peripherals.GPIO35, Level::Low);
+    let _guard = cpu_control
+    .start_app_core(unsafe { &mut *addr_of_mut!(CORE1_STACK) }, move || {
+        let executor1 = EXECUTOR1.init(Executor::new());
+        //let spawner = executor_core1.start(Priority::Priority1);
+        executor1.run(|spawner| {let _ = spawner.spawn(radio(spi, iv,debug_indicator));});
+        //spawner.spawn(radio(spi, iv)).ok();
+    })
+    .unwrap();
+    
+    loop{
+        CHANNEL.send("hola").await;
+        Timer::after(Duration::from_millis(100)).await;
+    }
+
+}
+
+#[embassy_executor::task]
+async fn radio(
+    spi: ExclusiveDevice<SpiDmaBus<'static, Async>, Output<'static>, Delay>,
+    iv: GenericSx126xInterfaceVariant<Output<'static>, Input<'static>>,
+    mut debug_indicator: Output<'static>,
+) {
+    info!(
+        "Starting radio() on core {}",
+        esp_hal::Cpu::current() as usize
+    );
+
+    let config = sx126x::Config {
+        chip: Sx1262,
+        tcxo_ctrl: Some(TcxoCtrlVoltage::Ctrl1V7),
+        use_dcdc: true,
+        rx_boost: false,
+    };
+    let mut lora = LoRa::new(Sx126x::new(spi, iv, config), true, Delay).await.unwrap();
+
+    let mdltn_params = {
+        match lora.create_modulation_params(
+            LORA_SPREADING_FACTOR,
+            LORA_BANDWIDTH,
+            LORA_CODING_RATE,
+            LORA_FREQUENCY_IN_HZ,
+        ) {
+            Ok(mp) => mp,
+            Err(err) => {
+                info!("Radio error = {:?}", err);
+                return;
+            }
+        }
+    };
+
+    let mut tx_pkt_params = {
+        match lora.create_tx_packet_params(LORA_PREAMBLE_LENGTH, false, true, false, &mdltn_params) {
+            Ok(pp) => pp,
+            Err(err) => {
+                info!("Radio error = {:?}", err);
+                return;
+            }
+        }
+    };
+
+    let mut receiving_buffer = [00u8; 100];
+    let mut rx_pkt_params = {
+        match lora.create_rx_packet_params(LORA_PREAMBLE_LENGTH, false, receiving_buffer.len() as u8, true, false, &mdltn_params) {
+            Ok(pp) => pp,
+            Err(err) => {
+                info!("Radio error = {:?}", err);
+                return;
+            }
+        }
+    };
+    
+    match lora
+        .prepare_for_rx(RxMode::Continuous, &mdltn_params, &rx_pkt_params)
+        .await
+    {
+        Ok(()) => {}
+        Err(err) => {
+            info!("Radio error = {:?}", err);
+            return;
+        }
+    };
+
+    loop {
+        receiving_buffer = [00u8; 100];
+        match lora.rx(&rx_pkt_params, &mut receiving_buffer).await {
+            Ok((received_len, _rx_pkt_status)) => {
+                let s = match str::from_utf8(&receiving_buffer[..received_len as usize]) {
+                    Ok(v) => v,
+                    Err(e) => panic!("Invalid UTF-8 sequence: {}", e),
+                };
+                info!("Message received = {}", s);
+                    info!("rx successful");
+                    debug_indicator.toggle();                
+            }
+            Err(err) => info!("rx unsuccessful = {:?}", err),
+        }
+    }
+}
